@@ -16,3 +16,8 @@ This GitHub account was created to enable our group of friends to collaborate on
 - **Front End Development** 🎨
 - **DevOps** 🚀
 - **Backend Development** 💻
+
+<p align="center">
+  <img src="https://github.com/MarsiasS/MarsiasS/blob/main/Gif.gif" alt="GIF" width="300"/>
+</p>
+

@@ -1,16 +1,13 @@
-## Hi there 👋
+## Marsias 👋
 
-<!--
-**MarsiasS/MarsiasS** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+This GitHub account was created to enable our group of friends to collaborate on projects and learn more about using Git/GitHub. Our goal is to develop better projects and improve our software development skills by working together and sharing our knowledge.
 
-Here are some ideas to get you started:
+### Our Interests Include:
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+- **Data Science** 📊
+- **Machine Learning** 🤖
+- **Mobile Game Development** 🎮
+- **Cyber Security** 🔐
+- **Front End Development** 🎨
+- **DevOps** 🚀
+- **Backend Development** 💻

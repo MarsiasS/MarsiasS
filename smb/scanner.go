@@ -126,7 +126,8 @@ func trySMB2Negotiate(conn net.Conn, result *SMBResult, timeout time.Duration) e
 	// Parse SMB2 response
 	result.Version = determineSMB2Version(smbResponse)
 	enabled, required := checkSMB2Signing(smbResponse)
-	result.SigningEnabled = enabled
+	// If required, then it is necessarily enabled from server perspective
+	result.SigningEnabled = enabled || required
 	result.SigningRequired = required
 	result.SecurityMode = getSMB2SecurityMode(smbResponse)
 	result.Dialects = parseSMB2Dialects(smbResponse)
@@ -195,49 +196,100 @@ func readNetBIOSPayload(conn net.Conn, timeout time.Duration) ([]byte, error) {
 }
 
 func createSMB2NegotiateRequest() []byte {
-	// SMB2 Header (64 bytes)
+	// Build SMB2 Header (64 bytes)
 	hdr := make([]byte, 64)
-	// ProtocolId \xFESMB
-	copy(hdr[0:4], []byte{0xFE, 0x53, 0x4D, 0x42})
-	// StructureSize = 64
-	binary.LittleEndian.PutUint16(hdr[4:6], 64)
-	// CreditCharge = 0, ChannelSequence/Reserved = 0
-	// Command = NEGOTIATE (0)
-	binary.LittleEndian.PutUint16(hdr[12:14], 0)
-	// CreditsRequested = 0
-	// Flags = 0
-	// NextCommand = 0
-	// MessageId = 0
-	// Reserved = 0
-	// TreeId = 0
-	// SessionId = 0
-	// Signature = 0
+	copy(hdr[0:4], []byte{0xFE, 0x53, 0x4D, 0x42})           // ProtocolId \xFESMB
+	binary.LittleEndian.PutUint16(hdr[4:6], 64)               // StructureSize
+	binary.LittleEndian.PutUint16(hdr[12:14], 0)              // Command = NEGOTIATE
+	// Other header fields remain zero
 
-	// SMB2 NEGOTIATE Request (pre-3.1.1 style, no negotiate contexts)
-	// Structure:
-	//  - StructureSize (2) = 36
-	//  - DialectCount (2)
-	//  - SecurityMode (2)
-	//  - Reserved (2)
-	//  - Capabilities (4)
-	//  - ClientGuid (16)
-	//  - Dialects (2 * count)
-
-	dialects := []uint16{0x0202, 0x0210, 0x0300, 0x0302}
-	dialectCount := uint16(len(dialects))
-
-	neg := &bytes.Buffer{}
-	_ = binary.Write(neg, binary.LittleEndian, uint16(0x24))          // StructureSize
-	_ = binary.Write(neg, binary.LittleEndian, dialectCount)          // DialectCount
-	_ = binary.Write(neg, binary.LittleEndian, uint16(0x0000))        // SecurityMode (no requirement)
-	_ = binary.Write(neg, binary.LittleEndian, uint16(0x0000))        // Reserved
-	_ = binary.Write(neg, binary.LittleEndian, uint32(0x00000000))    // Capabilities
-	_, _ = neg.Write(make([]byte, 16))                                // ClientGuid (zeros)
+	// Dialects including 3.1.1
+	dialects := []uint16{0x0202, 0x0210, 0x0300, 0x0302, 0x0311}
+	dialectBytes := &bytes.Buffer{}
 	for _, d := range dialects {
-		_ = binary.Write(neg, binary.LittleEndian, d) // Dialects
+		_ = binary.Write(dialectBytes, binary.LittleEndian, d)
 	}
 
-	payload := append(hdr, neg.Bytes()...)
+	// SMB2 NEGOTIATE Request fixed part (36 bytes)
+	neg := make([]byte, 36)
+	binary.LittleEndian.PutUint16(neg[0:2], 0x24)                      // StructureSize = 36
+	binary.LittleEndian.PutUint16(neg[2:4], uint16(len(dialects)))     // DialectCount
+	binary.LittleEndian.PutUint16(neg[4:6], 0x0001)                    // SecurityMode: client supports signing
+	binary.LittleEndian.PutUint16(neg[6:8], 0x0000)                    // Reserved
+	binary.LittleEndian.PutUint32(neg[8:12], 0x00000000)               // Capabilities
+	// ClientGuid (16 bytes) left as zeros at neg[12:28]
+	// We will set NegotiateContextOffset/Count below if we include contexts
+
+	// Prepare negotiate contexts for SMB 3.1.1
+	contextList := &bytes.Buffer{}
+	contextCount := uint16(0)
+
+	// Context 1: PREAUTH_INTEGRITY_CAPABILITIES (Type = 0x0001)
+	{
+		data := &bytes.Buffer{}
+		_ = binary.Write(data, binary.LittleEndian, uint16(1)) // HashAlgorithmCount
+		_ = binary.Write(data, binary.LittleEndian, uint16(32)) // SaltLength
+		_ = binary.Write(data, binary.LittleEndian, uint16(0x0001)) // SHA-512
+		_, _ = data.Write(make([]byte, 32)) // Salt (zeros)
+
+		// Pad data to 8-byte boundary
+		padLen := (8 - (data.Len() % 8)) % 8
+		if padLen > 0 {
+			_, _ = data.Write(make([]byte, padLen))
+		}
+
+		// Write context header
+		_ = binary.Write(contextList, binary.LittleEndian, uint16(0x0001))                   // Type
+		_ = binary.Write(contextList, binary.LittleEndian, uint16(data.Len()))               // DataLength
+		_ = binary.Write(contextList, binary.LittleEndian, uint32(0))                        // Reserved
+		_, _ = contextList.Write(data.Bytes())
+		contextCount++
+	}
+
+	// Context 2: ENCRYPTION_CAPABILITIES (Type = 0x0002)
+	{
+		data := &bytes.Buffer{}
+		_ = binary.Write(data, binary.LittleEndian, uint16(2)) // CipherCount
+		_ = binary.Write(data, binary.LittleEndian, uint16(0x0001)) // AES-128-CCM
+		_ = binary.Write(data, binary.LittleEndian, uint16(0x0002)) // AES-128-GCM
+
+		// Pad to 8-byte boundary
+		padLen := (8 - (data.Len() % 8)) % 8
+		if padLen > 0 {
+			_, _ = data.Write(make([]byte, padLen))
+		}
+
+		_ = binary.Write(contextList, binary.LittleEndian, uint16(0x0002))                   // Type
+		_ = binary.Write(contextList, binary.LittleEndian, uint16(data.Len()))               // DataLength
+		_ = binary.Write(contextList, binary.LittleEndian, uint32(0))                        // Reserved
+		_, _ = contextList.Write(data.Bytes())
+		contextCount++
+	}
+
+	// Compute NegotiateContextOffset after dialects + padding
+	// The offset is from the beginning of the SMB2 header (hdr start)
+	dialectsLen := dialectBytes.Len()
+	// Current offset from header start to end of dialects
+	current := 64 + len(neg) + dialectsLen
+	pad := (8 - (current % 8)) % 8
+	padding := make([]byte, pad)
+
+	if contextCount > 0 {
+		binary.LittleEndian.PutUint32(neg[28:32], uint32(64+len(neg)+dialectsLen+pad)) // NegotiateContextOffset
+		binary.LittleEndian.PutUint16(neg[32:34], contextCount)                        // NegotiateContextCount
+		binary.LittleEndian.PutUint16(neg[34:36], 0)                                   // Reserved2
+	} else {
+		binary.LittleEndian.PutUint32(neg[28:32], 0)
+		binary.LittleEndian.PutUint16(neg[32:34], 0)
+		binary.LittleEndian.PutUint16(neg[34:36], 0)
+	}
+
+	payload := make([]byte, 0, 64+len(neg)+dialectsLen+len(padding)+contextList.Len())
+	payload = append(payload, hdr...)
+	payload = append(payload, neg...)
+	payload = append(payload, dialectBytes.Bytes()...)
+	payload = append(payload, padding...)
+	payload = append(payload, contextList.Bytes()...)
 
 	// NetBIOS Session Service header (big-endian 3-byte length)
 	netbios := make([]byte, 4)

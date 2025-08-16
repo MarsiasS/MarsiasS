@@ -66,22 +66,23 @@ func scanIMAPPlain(target string, port int, timeout time.Duration) (banner strin
 	reader := textproto.NewReader(bufio.NewReader(conn))
 	writer := textproto.NewWriter(bufio.NewWriter(conn))
 
-	// server greeting (untagged)
-	greet, _ := reader.ReadLine()
-	banner = strings.TrimSpace(greet)
+	// Read greeting and any inline [CAPABILITY ...]
+	greetBanner, greetCaps := readGreeting(reader)
+	banner = greetBanner
 
-	capabilities, starttlsSupported, logindisabled := fetchCapabilities(reader, writer, timeout)
-	starttls = starttlsSupported
+	// Expand capabilities with CAPABILITY command
+	caps2, starttlsSupported, logindisabled := fetchCapabilities(reader, writer, timeout)
+	caps := mergeCaps(greetCaps, caps2)
+	_ = caps
+	starttls = starttlsSupported || hasToken(caps, "STARTTLS")
 
 	// Determine if plaintext login is allowed on the current (unencrypted) connection
-	// If LOGINDISABLED is present, plaintext login should be disabled until STARTTLS
-	if logindisabled {
+	if logindisabled || hasToken(caps, "LOGINDISABLED") {
 		plaintextAllowed = false
 		return
 	}
 
-	// If capabilities advertise LOGIN or AUTH=PLAIN, attempt a safe LOGIN to test policy
-	if hasLoginCapability(capabilities) {
+	if hasLoginCapability(caps) {
 		tag := "B001"
 		_ = writer.PrintfLine("%s LOGIN test test", tag)
 		_ = writer.W.Flush()
@@ -99,11 +100,9 @@ func scanIMAPPlain(target string, port int, timeout time.Duration) (banner strin
 		plaintextResp = strings.TrimSpace(strings.Join(respLines, "\n"))
 
 		upperResp := strings.ToUpper(plaintextResp)
-		// If server responds BAD and mentions TLS/ENCRYPTION required, then plaintext is not allowed
 		if strings.Contains(upperResp, "TLS") || strings.Contains(upperResp, "ENCRYPT") || strings.Contains(upperResp, "STARTTLS") || strings.Contains(upperResp, "LOGINDISABLED") {
 			plaintextAllowed = false
 		} else {
-			// NO or OK both indicate that LOGIN command can be processed on plaintext channel
 			plaintextAllowed = true
 		}
 	} else {
@@ -126,17 +125,61 @@ func scanIMAPTLS(target string, port int, timeout time.Duration) (banner string,
 	reader := textproto.NewReader(bufio.NewReader(conn))
 	writer := textproto.NewWriter(bufio.NewWriter(conn))
 
-	greet, _ := reader.ReadLine()
-	banner = strings.TrimSpace(greet)
+	greetBanner, greetCaps := readGreeting(reader)
+	banner = greetBanner
 
-	capabilities, _, _ := fetchCapabilities(reader, writer, timeout)
-	_ = capabilities
+	caps2, starttlsSupported, _ := fetchCapabilities(reader, writer, timeout)
+	caps := mergeCaps(greetCaps, caps2)
+	starttls = starttlsSupported || hasToken(caps, "STARTTLS")
 
-	// On implicit TLS, plaintext over the wire is already encrypted, so we do not flag it as plaintext vulnerability
+	// On implicit TLS, plaintext over the wire is already encrypted
 	plaintextAllowed = false
-	starttls = false
 	plaintextResp = ""
 	return
+}
+
+func readGreeting(reader *textproto.Reader) (banner string, caps []string) {
+	var first string
+	var found bool
+	var foundCaps []string
+	for i := 0; i < 20; i++ {
+		line, err := reader.ReadLine()
+		if err != nil {
+			break
+		}
+		if !found {
+			first = strings.TrimSpace(line)
+			found = true
+		}
+		upper := strings.ToUpper(line)
+		// Typical greeting starts with "* OK" or "* PREAUTH"
+		if strings.HasPrefix(upper, "* OK") || strings.HasPrefix(upper, "* PREAUTH") || strings.HasPrefix(upper, "* BYE") {
+			lcap := parseBracketCapabilities(line)
+			if len(lcap) > 0 {
+				foundCaps = append(foundCaps, lcap...)
+			}
+			// Some servers only send one line; we don't strictly require a terminator here
+			// Break after capturing first significant greeting line
+			break
+		}
+	}
+	return first, normalizeCaps(foundCaps)
+}
+
+func parseBracketCapabilities(line string) []string {
+	upper := strings.ToUpper(line)
+	start := strings.Index(upper, "[CAPABILITY ")
+	if start < 0 {
+		return nil
+	}
+	start += len("[CAPABILITY ")
+	end := strings.Index(upper[start:], "]")
+	if end < 0 {
+		return nil
+	}
+	segment := line[start : start+end]
+	tokens := strings.Fields(segment)
+	return normalizeCaps(tokens)
 }
 
 func fetchCapabilities(reader *textproto.Reader, writer *textproto.Writer, timeout time.Duration) (capabilities []string, hasStartTLS bool, hasLoginDisabled bool) {
@@ -152,9 +195,9 @@ func fetchCapabilities(reader *textproto.Reader, writer *textproto.Writer, timeo
 		upper := strings.ToUpper(line)
 		if strings.HasPrefix(line, "*") && strings.Contains(upper, "CAPABILITY") {
 			// Example: * CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN
-			// collect tokens after CAPABILITY keyword
 			idx := strings.Index(upper, "CAPABILITY")
 			if idx >= 0 {
+				// slice original line maintains token cases
 				fields := strings.Fields(line[idx+len("CAPABILITY"):])
 				for _, f := range fields {
 					caps = append(caps, strings.TrimSpace(f))
@@ -167,10 +210,7 @@ func fetchCapabilities(reader *textproto.Reader, writer *textproto.Writer, timeo
 		}
 	}
 
-	upperCaps := make([]string, 0, len(caps))
-	for _, c := range caps {
-		upperCaps = append(upperCaps, strings.ToUpper(c))
-	}
+	upperCaps := normalizeCaps(caps)
 	capabilities = upperCaps
 	for _, c := range upperCaps {
 		if c == "STARTTLS" {
@@ -198,9 +238,52 @@ func hasInfoLeak(banner string) bool {
 		return false
 	}
 	// Common IMAP server products that often leak in greeting/banners
-	leakers := []string{"dovecot", "cyrus", "courier", "uw-imap", "imap"}
+	leakers := []string{"dovecot", "cyrus", "courier", "uw-imap", "exchange", "gmail", "cisco", "citadel", "hmailserver", "imap"}
 	for _, k := range leakers {
 		if strings.Contains(b, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCaps(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, t := range in {
+		u := strings.ToUpper(strings.TrimSpace(t))
+		if u == "" {
+			continue
+		}
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out
+}
+
+func mergeCaps(a, b []string) []string {
+	if len(a) == 0 {
+		return normalizeCaps(b)
+	}
+	if len(b) == 0 {
+		return normalizeCaps(a)
+	}
+	return normalizeCaps(append(append([]string{}, a...), b...))
+}
+
+func hasToken(caps []string, token string) bool {
+	if len(caps) == 0 {
+		return false
+	}
+	t := strings.ToUpper(token)
+	for _, c := range caps {
+		if c == t {
 			return true
 		}
 	}

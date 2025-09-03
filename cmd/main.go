@@ -10,10 +10,14 @@ import (
 	"forftp/ntp"
 	"forftp/telnet"
 	"forftp/ipmi"
+	"forftp/ldap"
+	"forftp/mssql"
+	"forftp/redis"
+	"forftp/sip"
 )
 
 func main() {
-	protocol := flag.String("protocol", "vnc", "Protokol (vnc, ntp, telnet, ipmi)")
+	protocol := flag.String("protocol", "vnc", "Protokol (vnc, ntp, telnet, ipmi, ldap, mssql, redis, sip)")
 	target := flag.String("t", "", "Hedef IP adresi")
 	timeout := flag.Int("timeout", 5, "Zaman aşımı süresi (saniye)")
 	flag.Parse()
@@ -33,6 +37,18 @@ func main() {
 		fmt.Println(res.String())
 	case "ipmi":
 		res := ipmi.ScanIPMI(config.Target, config.Timeout)
+		fmt.Println(res.String())
+	case "ldap":
+		res := ldapscan.ScanLDAP(config.Target, config.Timeout)
+		fmt.Println(res.String())
+	case "mssql":
+		res := mssql.ScanMSSQL(config.Target, config.Timeout)
+		fmt.Println(res.String())
+	case "redis":
+		res := redis.ScanRedis(config.Target, config.Timeout)
+		fmt.Println(res.String())
+	case "sip":
+		res := sip.ScanSIP(config.Target, config.Timeout)
 		fmt.Println(res.String())
 	default:
 		fmt.Println("[-] Desteklenmeyen protokol!")

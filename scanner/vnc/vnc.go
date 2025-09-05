@@ -184,6 +184,7 @@ func ScanVNC(target string, timeout time.Duration) VNCResult {
 type VNCAuthResult struct {
 	Target       string
 	Port         int
+	Username     string
 	Password     string
 	Success      bool
 	ErrorMessage string
@@ -194,10 +195,12 @@ func (r VNCAuthResult) String() string {
 	if r.Success {
 		status = "[+]"
 	}
+	userPart := ""
+	if r.Username != "" { userPart = fmt.Sprintf("%s:", r.Username) }
 	if r.ErrorMessage != "" {
-		return fmt.Sprintf("%s VNC auth %s:%d %q -> error: %s", status, r.Target, r.Port, r.Password, r.ErrorMessage)
+		return fmt.Sprintf("%s VNC auth %s:%d %s%q -> error: %s", status, r.Target, r.Port, userPart, r.Password, r.ErrorMessage)
 	}
-	return fmt.Sprintf("%s VNC auth %s:%d %q", status, r.Target, r.Port, r.Password)
+	return fmt.Sprintf("%s VNC auth %s:%d %s%q", status, r.Target, r.Port, userPart, r.Password)
 }
 
 // BruteForceVNC attempts VNC authentication using provided passwords concurrently.
@@ -218,6 +221,7 @@ func BruteForceVNC(target string, passwords []string, timeout time.Duration, con
 			results = append(results, VNCAuthResult{
 				Target:       target,
 				Port:         5900,
+				Username:     "",
 				Password:     pw,
 				Success:      ok,
 				ErrorMessage: errStr(err),
@@ -237,6 +241,44 @@ func BruteForceVNC(target string, passwords []string, timeout time.Duration, con
 	close(jobs)
 	wg.Wait()
 	return results
+}
+
+// BruteForceVNCWithUsers attempts all username x password combinations.
+// Username is not part of classic RFB auth; included for labeling/reporting only.
+func BruteForceVNCWithUsers(target string, usernames []string, passwords []string, timeout time.Duration, concurrency int) []VNCAuthResult {
+    if concurrency <= 0 { concurrency = 5 }
+    type combo struct{ user, pass string }
+    jobs := make(chan combo)
+    results := make([]VNCAuthResult, 0, len(usernames)*len(passwords))
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+
+    worker := func() {
+        defer wg.Done()
+        for job := range jobs {
+            ok, err := tryVNCPassword(target, job.pass, timeout)
+            mu.Lock()
+            results = append(results, VNCAuthResult{
+                Target:       target,
+                Port:         5900,
+                Username:     job.user,
+                Password:     job.pass,
+                Success:      ok,
+                ErrorMessage: errStr(err),
+            })
+            mu.Unlock()
+        }
+    }
+
+    for i := 0; i < concurrency; i++ { wg.Add(1); go worker() }
+    go func() {
+        for _, u := range usernames {
+            for _, p := range passwords { jobs <- combo{u, p} }
+        }
+        close(jobs)
+    }()
+    wg.Wait()
+    return results
 }
 
 // tryVNCPassword performs a fresh connection and RFB auth attempt using given password
